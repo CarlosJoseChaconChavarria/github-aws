@@ -1,0 +1,5 @@
+.env
+.env.local
+trust-policy.json
+.aws/
+credentials
