@@ -1,0 +1,84 @@
+name: Deploy AWS VPC
+
+# workflow_dispatch = manual trigger only.
+# Prevents a new VPC from being created on every git push.
+# AWS default limit is 5 VPCs per region — avoid auto-triggering.
+on:
+  workflow_dispatch:
+
+env:
+  # Values come from GitHub Actions repository variables — nothing is hardcoded.
+  # Set these in: Settings → Secrets and variables → Actions → Variables tab
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+permissions:
+  # id-token: write is REQUIRED for OIDC.
+  # Allows the workflow to request a short-lived JWT token from GitHub.
+  # Without this, the authentication step silently fails.
+  id-token: write
+  # contents: read allows the workflow to check out the repository code.
+  contents: read
+
+jobs:
+  deploy-vpc:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Check out the repo so the runner has access to all files.
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Authenticate to AWS using OIDC (no stored secrets needed).
+      # This action handles the full token exchange:
+      #   1. Requests a JWT from GitHub (needs id-token: write above)
+      #   2. Sends the JWT to AWS STS via AssumeRoleWithWebIdentity
+      #   3. AWS validates the token against the OIDC provider
+      #   4. AWS checks the trust policy conditions (sub + aud)
+      #   5. AWS returns temporary credentials (15min–1hr)
+      # Equivalent to: gcloud auth login via WIF in GCP.
+      #
+      # role-to-assume: the ARN of the IAM role created by setup-aws.sh
+      # role-session-name: labels this session in CloudTrail for auditing
+      # aws-region: sets the default region for all subsequent AWS CLI calls
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/${{ vars.AWS_ROLE_NAME }}
+          role-session-name: GitHub_to_AWS_via_FederatedOIDC
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Verify the identity assumed by the workflow.
+      # Prints the assumed role ARN — confirms OIDC worked correctly.
+      # Students should see the GitHubAction role here, not a user.
+      - name: Verify identity
+        run: aws sts get-caller-identity
+
+      # Create a VPC with CIDR block 10.0.0.0/16 (65,536 addresses).
+      # --tag-specifications adds a Name tag visible in the AWS console.
+      # --query 'Vpc.VpcId' extracts just the ID from the JSON response.
+      # --output text returns it as plain text (no quotes).
+      # The VPC ID is saved to $GITHUB_ENV so the next step can read it.
+      - name: Create VPC
+        run: |
+          VPC_ID=$(aws ec2 create-vpc \
+            --cidr-block 10.0.0.0/16 \
+            --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=vpc-gh-created}]' \
+            --query 'Vpc.VpcId' \
+            --output text)
+          echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
+          echo "✅ Created VPC: $VPC_ID"
+
+      # Create a subnet inside the VPC from the previous step.
+      # ${{ env.VPC_ID }} reads the value saved to $GITHUB_ENV above.
+      # CIDR 10.0.1.0/24 is a subset of the VPC's 10.0.0.0/16 (256 addresses).
+      # Availability zone = first AZ in the region (e.g. us-east-1a).
+      - name: Create Subnet
+        run: |
+          SUBNET_ID=$(aws ec2 create-subnet \
+            --vpc-id ${{ env.VPC_ID }} \
+            --cidr-block 10.0.1.0/24 \
+            --availability-zone ${AWS_REGION}a \
+            --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=subnet-gh-created}]' \
+            --query 'Subnet.SubnetId' \
+            --output text)
+          echo "✅ Created Subnet: $SUBNET_ID"
